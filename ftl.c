@@ -155,18 +155,90 @@ ftl_status_t ftl_trim(ftl_t* ftl, uint32_t lpn)
 
 double ftl_waf(const ftl_t* ftl)
 {
-    (void)ftl;   /* TODO */
-    return 0.0;
+    if (ftl->stats.host_writes == 0) return 0.0;
+    return (double)ftl->stats.nand_writes / ftl->stats.host_writes;
 }
 
 void ftl_print_stats(const ftl_t* ftl)
 {
-    (void)ftl;   /* TODO */
-    printf("(stats not implemented yet)\n");
+    uint32_t min_ec = UINT32_MAX;
+    uint32_t max_ec = 0;
+    uint64_t total_ec = 0;
+    for (uint16_t i = 0; i < NUM_BLOCKS; i++) {
+        if (ftl->blocks[i].erase_count < min_ec) {
+            min_ec = ftl->blocks[i].erase_count;
+        }
+        if (ftl->blocks[i].erase_count > max_ec) {
+            max_ec = ftl->blocks[i].erase_count;
+        }
+        total_ec += ftl->blocks[i].erase_count;
+    }
+    printf("host_writes : %llu\n", (unsigned long long)ftl->stats.host_writes);
+    printf("nand_writes : %llu\n", (unsigned long long)ftl->stats.nand_writes);
+    printf("gc_count : %llu\n", (unsigned long long)ftl->stats.gc_count);
+    printf("gc_moved_pages : %llu\n", (unsigned long long)ftl->stats.gc_moved_pages);
+    printf("erase_total : %llu\n", (unsigned long long)ftl->stats.erase_total);
+
+    printf("WAF : %f\n", ftl_waf(ftl));
+    printf("min_ec :  %llu\n", (unsigned long long) min_ec);
+    printf("max_ec :  %llu\n", (unsigned long long) max_ec);
+    printf("avg_ec :  %f\n", (double) total_ec/NUM_BLOCKS);
 }
 
 bool ftl_check_consistency(const ftl_t* ftl)
 {
-    (void)ftl;   /* TODO */
+    uint16_t free_count = 0;
+    uint64_t total_ec = 0;
+    uint64_t total_valid = 0;
+
+    for (uint16_t i = 0; i < NUM_BLOCKS; i++) {
+        const block_t* b = &ftl->blocks[i];
+
+        if (b->valid_count != bit_popcount64(b->valid_bitmap)) {
+            printf("valid_count mismatch: block=%u valid_count=%u popcount=%d\n",
+                i, b->valid_count, bit_popcount64(b->valid_bitmap));
+            return false;
+        }
+        if (b->state == BLK_FREE) free_count++;
+        total_ec += b->erase_count;
+        total_valid += b->valid_count;
+    }
+
+    if (free_count != ftl->free_block_count) {
+        printf("free_block_count mismatch: counted=%u recorded=%u\n",
+            free_count, ftl->free_block_count);
+        return false;
+    }
+    if (total_ec != ftl->stats.erase_total) {
+        printf("erase_total mismatch: sum=%llu recorded=%llu\n",
+            (unsigned long long)total_ec, (unsigned long long)ftl->stats.erase_total);
+        return false;
+    }
+
+    uint64_t mapped = 0;
+
+    for (uint32_t lpn = 0; lpn < LOGICAL_PAGES; lpn++) {
+        uint32_t ppa = ftl->l2p[lpn];
+        if (ppa == INVALID_PPA) continue;
+        mapped++;
+
+        if (ftl->p2l[ppa] != lpn) {
+            printf("l2p/p2l mismatch: lpn=%u ppa=%u\n", lpn, ppa);
+            return false;
+        }
+        uint32_t blk = PPA_BLOCK(ppa);
+        uint32_t page = PPA_PAGE(ppa);
+        if (!(ftl->blocks[blk].valid_bitmap & (1ULL << page))) {
+            printf("page not valid: lpn=%u block=%u page=%u\n", lpn, blk, page);
+            return false;
+        }
+    }
+
+    if (total_valid != mapped) {
+        printf("valid page leak: valid_pages=%llu mapped_lpns=%llu\n",
+            (unsigned long long)total_valid, (unsigned long long)mapped);
+        return false;
+    }
+
     return true;
 }
