@@ -1,6 +1,5 @@
 /*
- * ftl.c - Mini FTL Simulator 實作
- * 目前全部是空殼(stub),只用來確認環境能編譯、能執行
+ * ftl.c - Mini FTL Simulator
  */
 #include <stdio.h>
 #include <string.h>
@@ -13,10 +12,14 @@ static void     invalidate_ppa(ftl_t* ftl, uint32_t ppa);
 static uint32_t get_next_ppa(ftl_t* ftl);
 static void     nand_erase(ftl_t* ftl, uint16_t blk);
 static uint16_t gc_pick_victim(const ftl_t* ftl);
+static void     gc_run(ftl_t* ftl);
 
+/* ================= NAND layer ================= */
+
+/* Program one page. Pages must be written in order, never overwritten. */
 static void nand_program(ftl_t* ftl, uint32_t ppa)
 {
-    uint32_t blk = PPA_BLOCK(ppa);   
+    uint32_t blk = PPA_BLOCK(ppa);
     uint32_t page = PPA_PAGE(ppa);
     block_t* b = &ftl->blocks[blk];
 
@@ -27,29 +30,32 @@ static void nand_program(ftl_t* ftl, uint32_t ppa)
     ftl->stats.nand_writes++;
 }
 
+/* Erase a whole block. All valid data must have been relocated first. */
+static void nand_erase(ftl_t* ftl, uint16_t blk) {
+    block_t* b = &ftl->blocks[blk];
+    assert(b->valid_count == 0);
+    b->valid_bitmap = 0;
+    b->write_ptr = 0;
+    b->erase_count++;
+    b->state = BLK_FREE;
+    ftl->free_block_count++;
+    ftl->stats.erase_total++;
+}
+
+/* ================= Block / page management ================= */
+
 static void invalidate_ppa(ftl_t* ftl, uint32_t ppa) {
     uint32_t blk = PPA_BLOCK(ppa);
     uint32_t page = PPA_PAGE(ppa);
     block_t* b = &ftl->blocks[blk];
 
-    assert(b->valid_bitmap & (1ULL << page));   // 這個 page 必須原本是 valid
+    assert(b->valid_bitmap & (1ULL << page));   /* must be valid before invalidation */
     b->valid_bitmap &= ~(1ULL << page);
     b->valid_count--;
     ftl->p2l[ppa] = INVALID_LPN;
 }
 
-static uint32_t get_next_ppa(ftl_t* ftl) {
-    block_t* b = &ftl->blocks[ftl->active_block];
-
-    if (b->write_ptr == PAGES_PER_BLOCK) {
-        b->state = BLK_FULL;
-        ftl->active_block = alloc_free_block(ftl);
-        assert(ftl->active_block != INVALID_BLOCK);
-        b = &ftl->blocks[ftl->active_block];
-    }
-    return PPA(ftl->active_block, b->write_ptr);
-}
-
+/* Dynamic wear leveling: pick the free block with the lowest erase count. */
 static uint16_t alloc_free_block(ftl_t* ftl) {
     uint16_t best = INVALID_BLOCK;
     uint32_t min_ec = UINT32_MAX;
@@ -69,17 +75,22 @@ static uint16_t alloc_free_block(ftl_t* ftl) {
     return best;
 }
 
-static void nand_erase(ftl_t* ftl, uint16_t blk) {
-    block_t* b = &ftl->blocks[blk];
-    assert(b->valid_count == 0);
-    b->valid_bitmap = 0;
-    b->write_ptr = 0;
-    b->erase_count++;
-    b->state = BLK_FREE;
-    ftl->free_block_count++;
-    ftl->stats.erase_total++;
+/* Next writable PPA; opens a new block when the active one is full. */
+static uint32_t get_next_ppa(ftl_t* ftl) {
+    block_t* b = &ftl->blocks[ftl->active_block];
+
+    if (b->write_ptr == PAGES_PER_BLOCK) {
+        b->state = BLK_FULL;
+        ftl->active_block = alloc_free_block(ftl);
+        assert(ftl->active_block != INVALID_BLOCK);
+        b = &ftl->blocks[ftl->active_block];   /* b still pointed at the old block */
+    }
+    return PPA(ftl->active_block, b->write_ptr);
 }
 
+/* ================= Garbage collection ================= */
+
+/* Greedy policy: the full block with the fewest valid pages costs the least to reclaim. */
 static uint16_t gc_pick_victim(const ftl_t* ftl) {
     uint16_t best = INVALID_BLOCK;
     uint32_t min_va = UINT32_MAX;
@@ -93,6 +104,8 @@ static uint16_t gc_pick_victim(const ftl_t* ftl) {
     }
     return best;
 }
+
+/* Relocate the victim's valid pages, then erase it. */
 static void gc_run(ftl_t* ftl) {
     ftl->in_gc = true;
     uint16_t victim = gc_pick_victim(ftl);
@@ -100,7 +113,7 @@ static void gc_run(ftl_t* ftl) {
     block_t* b = &ftl->blocks[victim];
 
     for (uint32_t page = 0; page < PAGES_PER_BLOCK; page++) {
-        if (!(b->valid_bitmap & (1ULL << page))) continue;   // 不是 valid 就跳過
+        if (!(b->valid_bitmap & (1ULL << page))) continue;
         uint32_t old_ppa = PPA(victim, page);
         uint32_t lpn = ftl->p2l[old_ppa];
         uint32_t new_ppa = get_next_ppa(ftl);
@@ -114,16 +127,19 @@ static void gc_run(ftl_t* ftl) {
     ftl->in_gc = false;
 }
 
+/* ================= Host interface ================= */
+
 void ftl_init(ftl_t* ftl)
 {
-    memset(ftl, 0, sizeof(*ftl));   // blocks、stats、in_gc 全部歸零
-    memset(ftl->l2p, 0xFF, sizeof(ftl->l2p));
-    memset(ftl->p2l, 0xFF, sizeof(ftl->p2l));
+    memset(ftl, 0, sizeof(*ftl));
+    memset(ftl->l2p, 0xFF, sizeof(ftl->l2p));   /* every byte 0xFF -> INVALID_PPA */
+    memset(ftl->p2l, 0xFF, sizeof(ftl->p2l));   /* every byte 0xFF -> INVALID_LPN */
     ftl->in_gc = false;
-    ftl->free_block_count = NUM_BLOCKS;              // 一開始全部都是 free
-    ftl->active_block = alloc_free_block(ftl);       // 由它挑選並負責扣 1
+    ftl->free_block_count = NUM_BLOCKS;
+    ftl->active_block = alloc_free_block(ftl);
 }
 
+/* Out-of-place update: write to a new page, then invalidate the old one. */
 ftl_status_t ftl_write(ftl_t* ftl, uint32_t lpn)
 {
     if (lpn >= LOGICAL_PAGES) return FTL_ERR_LPN_OUT_OF_RANGE;
@@ -131,7 +147,8 @@ ftl_status_t ftl_write(ftl_t* ftl, uint32_t lpn)
     while (!ftl->in_gc && ftl->free_block_count < GC_THRESHOLD) {
         gc_run(ftl);
     }
-    uint32_t old_ppa = ftl->l2p[lpn];     
+    /* Read the mapping only after GC: GC may have relocated this LPN. */
+    uint32_t old_ppa = ftl->l2p[lpn];
     uint32_t new_ppa = get_next_ppa(ftl);
     nand_program(ftl, new_ppa);
     if (old_ppa != INVALID_PPA) invalidate_ppa(ftl, old_ppa);
@@ -149,7 +166,7 @@ ftl_status_t ftl_read(const ftl_t* ftl, uint32_t lpn, uint32_t* ppa_out)
 
 ftl_status_t ftl_trim(ftl_t* ftl, uint32_t lpn)
 {
-    (void)ftl; (void)lpn;   /* TODO(選做) */
+    (void)ftl; (void)lpn;   /* TODO */
     return FTL_OK;
 }
 
@@ -182,7 +199,7 @@ void ftl_print_stats(const ftl_t* ftl)
     printf("WAF : %f\n", ftl_waf(ftl));
     printf("min_ec :  %llu\n", (unsigned long long) min_ec);
     printf("max_ec :  %llu\n", (unsigned long long) max_ec);
-    printf("avg_ec :  %f\n", (double) total_ec/NUM_BLOCKS);
+    printf("avg_ec :  %f\n", (double)total_ec / NUM_BLOCKS);
 }
 
 bool ftl_check_consistency(const ftl_t* ftl)
@@ -191,6 +208,7 @@ bool ftl_check_consistency(const ftl_t* ftl)
     uint64_t total_ec = 0;
     uint64_t total_valid = 0;
 
+    /* Per-block checks */
     for (uint16_t i = 0; i < NUM_BLOCKS; i++) {
         const block_t* b = &ftl->blocks[i];
 
@@ -215,6 +233,7 @@ bool ftl_check_consistency(const ftl_t* ftl)
         return false;
     }
 
+    /* Mapping checks: l2p and p2l must agree, and mapped pages must be valid */
     uint64_t mapped = 0;
 
     for (uint32_t lpn = 0; lpn < LOGICAL_PAGES; lpn++) {
@@ -234,6 +253,7 @@ bool ftl_check_consistency(const ftl_t* ftl)
         }
     }
 
+    /* Every valid page must be referenced by some LPN */
     if (total_valid != mapped) {
         printf("valid page leak: valid_pages=%llu mapped_lpns=%llu\n",
             (unsigned long long)total_valid, (unsigned long long)mapped);

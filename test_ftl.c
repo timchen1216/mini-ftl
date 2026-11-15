@@ -1,14 +1,13 @@
 /*
- * test_ftl.c - Mini FTL 測試
- * 編譯:gcc -std=c11 -Wall -Wextra -O2 ftl.c test_ftl.c -o test_ftl
- * 換 OP:gcc ... -DOP_PERCENT=28 ...
+ * test_ftl.c - Mini FTL tests and WAF experiment
+ * Build: gcc -std=c11 -Wall -Wextra -O2 ftl.c test_ftl.c -o test_ftl
+ * Change OP: add -DOP_PERCENT=28
  */
 #include <stdio.h>
 #include <stdlib.h>
-#include <assert.h>
 #include "ftl.h"
 
- /* 和 assert 不同:Release 下也一定會執行 expr,不會把 ftl_write 這類呼叫一起移除 */
+ /* Unlike assert, expr is always evaluated, even in Release builds (NDEBUG). */
 #define CHECK(expr) do {                                               \
     if (!(expr)) {                                                     \
         fprintf(stderr, "CHECK failed: %s (%s:%d)\n",                  \
@@ -17,9 +16,9 @@
     }                                                                  \
 } while (0)
 
-static ftl_t g_ftl;   /* 很大，放 static 區不要放 stack */
+static ftl_t g_ftl;   /* too large for the stack */
 
-/* 簡單的 xorshift 亂數，結果可重現 */
+/* xorshift PRNG, deterministic */
 static uint32_t rng_state = 12345u;
 static uint32_t rng(void) {
     rng_state ^= rng_state << 13;
@@ -28,7 +27,7 @@ static uint32_t rng(void) {
     return rng_state;
 }
 
-/* 1. 基本讀寫 */
+/* 1. Basic read/write */
 static void test_basic_rw(void) {
     uint32_t ppa;
     ftl_init(&g_ftl);
@@ -41,7 +40,7 @@ static void test_basic_rw(void) {
     printf("[PASS] basic read/write\n");
 }
 
-/* 2. 覆寫同一個 LPN 必須 out-of-place */
+/* 2. Overwriting an LPN must go to a new page */
 static void test_out_of_place(void) {
     uint32_t ppa1, ppa2;
     ftl_init(&g_ftl);
@@ -56,10 +55,10 @@ static void test_out_of_place(void) {
     printf("[PASS] out-of-place update\n");
 }
 
-/* 3. 寫入量遠超容量，GC 必須讓 mapping 保持正確 */
+/* 3. Many times the capacity in random writes; mapping must survive GC */
 static void test_gc_correctness(void) {
     ftl_init(&g_ftl);
-    for (uint32_t i = 0; i < LOGICAL_PAGES; i++) ftl_write(&g_ftl, i);   /* 先填滿 */
+    for (uint32_t i = 0; i < LOGICAL_PAGES; i++) ftl_write(&g_ftl, i);   /* fill the drive */
     for (uint32_t i = 0; i < LOGICAL_PAGES * 10u; i++) {
         CHECK(ftl_write(&g_ftl, rng() % LOGICAL_PAGES) == FTL_OK);
     }
@@ -74,11 +73,11 @@ static void test_gc_correctness(void) {
         (unsigned long long)g_ftl.stats.gc_count);
 }
 
-/* 4. 實驗:sequential vs random 的 WAF，輸出成 CSV 方便畫圖 */
+/* 4. WAF experiment: sequential vs random, printed as CSV */
 static void run_workload(const char* name, int random) {
     ftl_init(&g_ftl);
     for (uint32_t i = 0; i < LOGICAL_PAGES; i++) ftl_write(&g_ftl, i);
-    g_ftl.stats.host_writes = 0;          /* 只看穩態，扣掉預填 */
+    g_ftl.stats.host_writes = 0;          /* measure steady state only */
     g_ftl.stats.nand_writes = 0;
     for (uint32_t i = 0; i < LOGICAL_PAGES * 20u; i++) {
         uint32_t lpn = random ? (rng() % LOGICAL_PAGES) : (i % LOGICAL_PAGES);
