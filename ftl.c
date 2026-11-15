@@ -7,22 +7,12 @@
 #include <assert.h>
 #include "ftl.h"
 
- /* ================= 內部函式 =================
- 
-  * 之後實作時，把下面的宣告取消註解並補上內容
-  *
-  
-  * static void     nand_erase(ftl_t *ftl, uint16_t blk);
- 
-  * static uint16_t gc_pick_victim(const ftl_t *ftl);
-  * static void     gc_run(ftl_t *ftl);
-  */
-
-  /* ================= 對外介面 ================= */
 static uint16_t alloc_free_block(ftl_t* ftl);
 static void     nand_program(ftl_t* ftl, uint32_t ppa);
 static void     invalidate_ppa(ftl_t* ftl, uint32_t ppa);
 static uint32_t get_next_ppa(ftl_t* ftl);
+static void     nand_erase(ftl_t* ftl, uint16_t blk);
+static uint16_t gc_pick_victim(const ftl_t* ftl);
 
 static void nand_program(ftl_t* ftl, uint32_t ppa)
 {
@@ -79,6 +69,51 @@ static uint16_t alloc_free_block(ftl_t* ftl) {
     return best;
 }
 
+static void nand_erase(ftl_t* ftl, uint16_t blk) {
+    block_t* b = &ftl->blocks[blk];
+    assert(b->valid_count == 0);
+    b->valid_bitmap = 0;
+    b->write_ptr = 0;
+    b->erase_count++;
+    b->state = BLK_FREE;
+    ftl->free_block_count++;
+    ftl->stats.erase_total++;
+}
+
+static uint16_t gc_pick_victim(const ftl_t* ftl) {
+    uint16_t best = INVALID_BLOCK;
+    uint32_t min_va = UINT32_MAX;
+
+    for (uint16_t i = 0; i < NUM_BLOCKS; i++) {
+        if (ftl->blocks[i].state != BLK_FULL) continue;
+        if (ftl->blocks[i].valid_count < min_va) {
+            best = i;
+            min_va = ftl->blocks[i].valid_count;
+        }
+    }
+    return best;
+}
+static void gc_run(ftl_t* ftl) {
+    ftl->in_gc = true;
+    uint16_t victim = gc_pick_victim(ftl);
+    assert(victim != INVALID_BLOCK);
+    block_t* b = &ftl->blocks[victim];
+
+    for (uint32_t page = 0; page < PAGES_PER_BLOCK; page++) {
+        if (!(b->valid_bitmap & (1ULL << page))) continue;   // 不是 valid 就跳過
+        uint32_t old_ppa = PPA(victim, page);
+        uint32_t lpn = ftl->p2l[old_ppa];
+        uint32_t new_ppa = get_next_ppa(ftl);
+        nand_program(ftl, new_ppa);
+        invalidate_ppa(ftl, old_ppa);
+        ftl->l2p[lpn] = new_ppa;  ftl->p2l[new_ppa] = lpn;
+        ftl->stats.gc_moved_pages++;
+    }
+    nand_erase(ftl, victim);
+    ftl->stats.gc_count++;
+    ftl->in_gc = false;
+}
+
 void ftl_init(ftl_t* ftl)
 {
     memset(ftl, 0, sizeof(*ftl));   // blocks、stats、in_gc 全部歸零
@@ -93,7 +128,10 @@ ftl_status_t ftl_write(ftl_t* ftl, uint32_t lpn)
 {
     if (lpn >= LOGICAL_PAGES) return FTL_ERR_LPN_OUT_OF_RANGE;
     ftl->stats.host_writes++;
-    uint32_t old_ppa = ftl->l2p[lpn];
+    while (!ftl->in_gc && ftl->free_block_count < GC_THRESHOLD) {
+        gc_run(ftl);
+    }
+    uint32_t old_ppa = ftl->l2p[lpn];     
     uint32_t new_ppa = get_next_ppa(ftl);
     nand_program(ftl, new_ppa);
     if (old_ppa != INVALID_PPA) invalidate_ppa(ftl, old_ppa);
